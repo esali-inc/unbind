@@ -112,12 +112,18 @@
     function injectExportButton() {
         if (document.getElementById('unbind-export-btn')) return;
 
-        const sidebar = findSidebar();
-        if (sidebar) {
-            createSidebarButton(sidebar);
-        } else {
-            createFloatingButton();
-        }
+        // Always create floating button (guaranteed visible)
+        createFloatingButton();
+
+        // Also try sidebar as nicer UX after DOM settles
+        setTimeout(() => {
+            const sidebar = findSidebar();
+            if (sidebar) {
+                const existing = document.getElementById('unbind-export-btn');
+                if (existing) existing.remove();
+                createSidebarButton(sidebar);
+            }
+        }, 2000);
     }
 
     function createSidebarButton(sidebar) {

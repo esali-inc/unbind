@@ -1,5 +1,5 @@
 // ============================================================
-// UNBIND v2.0.0 — Content Script
+// UNBIND v2.1.0 — Content Script
 // Injected into chatgpt.com for one-click export
 // Supports: Free, Plus, Teams accounts
 // Output: UACS (Universal AI Conversation Standard)
@@ -12,7 +12,7 @@
     window.__UNBIND_LOADED__ = true;
 
     const CONFIG = {
-        VERSION: '2.0.0',
+        VERSION: '2.1.0',
         UACS_VERSION: '1.0.0',
         MIN_DELAY_MS: 400,
         MAX_DELAY_MS: 8000,
@@ -40,6 +40,11 @@
         workspace: null,
         exportFormat: 'json',
         speedSamples: [],
+        customGPTs: [],
+        projects: [],
+        userProfile: null,
+        canvasOutputs: [],
+        downloadedFiles: [],
     };
 
     // ============================================================
@@ -198,6 +203,9 @@
                         <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-archived" checked><span>Archived conversations</span></label>
                         <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-memory" checked><span>Memory & Custom Instructions</span></label>
                         <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-shared"><span>Shared conversations</span></label>
+                        <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-gpts" checked><span>Custom GPTs (MyGPTs)</span></label>
+                        <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-projects" checked><span>Projects & files</span></label>
+                        <label class="unbind-checkbox"><input type="checkbox" id="unbind-include-profile" checked><span>Profile & preferences</span></label>
                     </div>
 
                     <button id="unbind-start" class="unbind-btn-primary">Start Export</button>
@@ -347,6 +355,21 @@
                 await fetchPersonalization();
             }
 
+            // Fetch custom GPTs
+            if (document.getElementById('unbind-include-gpts')?.checked) {
+                await fetchCustomGPTs();
+            }
+
+            // Fetch projects
+            if (document.getElementById('unbind-include-projects')?.checked) {
+                await fetchProjects();
+            }
+
+            // Fetch user profile
+            if (document.getElementById('unbind-include-profile')?.checked) {
+                await fetchUserProfile();
+            }
+
             showComplete();
         } catch (error) {
             console.error('[Unbind] Export error:', error);
@@ -461,6 +484,13 @@
                         if (data?.mapping) {
                             state.messages[conv.id] = extractMessages(data);
                             state.totalMessages += state.messages[conv.id].length;
+
+                            // Extract canvas/artifact outputs
+                            const canvasItems = extractCanvasFromConversation(data);
+                            if (canvasItems.length > 0) {
+                                state.canvasOutputs.push({ conversation_id: conv.id, title: conv.title, items: canvasItems });
+                            }
+
                             state.successStreak++;
 
                             // Adaptive delay: speed up after successes
@@ -602,6 +632,21 @@
                 else if (part.content_type === 'text' || part.text) {
                     textParts.push(part.text || '');
                 }
+                // Canvas document
+                else if (part.content_type === 'real_time_user_canvas_action_text_document' ||
+                         part.content_type === 'canvas_text_document' ||
+                         part.content_type === 'text_document') {
+                    const title = part.title ? `**${part.title}**\n\n` : '';
+                    textParts.push(title + (part.text || part.content || '[Canvas Document]'));
+                }
+                // Canvas code
+                else if (part.content_type === 'real_time_user_canvas_action_code' ||
+                         part.content_type === 'canvas_code' ||
+                         part.content_type === 'code_document') {
+                    const lang = part.language || '';
+                    const code = part.text || part.code || part.content || '';
+                    textParts.push(`\\`\\`\\`${lang}\n${code}\n\\`\\`\\``);
+                }
                 // Fallback: stringify unknown objects
                 else {
                     textParts.push(`[${part.content_type || 'unknown'}: ${JSON.stringify(part).substring(0, 200)}]`);
@@ -631,6 +676,224 @@
             meta.finish_reason = msg.metadata.finish_details.type;
         }
         return Object.keys(meta).length > 0 ? meta : null;
+    }
+
+
+    // ============================================================
+    // CUSTOM GPTs (MyGPTs)
+    // ============================================================
+
+    async function fetchCustomGPTs() {
+        updateStatus('Fetching your custom GPTs...');
+        try {
+            // Try the discovery endpoint first (lists GPTs you created)
+            let allGPTs = [];
+            let cursor = null;
+            let hasMore = true;
+
+            while (hasMore) {
+                const url = cursor
+                    ? `/backend-api/gizmos/discovery/mine?cursor=${cursor}&limit=50`
+                    : '/backend-api/gizmos/discovery/mine?limit=50';
+                const data = await fetchAPI(url).catch(() => null);
+                if (!data?.list?.items || data.list.items.length === 0) {
+                    hasMore = false;
+                } else {
+                    allGPTs = allGPTs.concat(data.list.items);
+                    cursor = data.list.cursor;
+                    hasMore = !!cursor;
+                }
+            }
+
+            // Fetch full details for each GPT
+            for (let i = 0; i < allGPTs.length; i++) {
+                const gpt = allGPTs[i];
+                const gizmoId = gpt.resource?.gizmo?.id || gpt.gizmo?.id || gpt.id;
+                if (!gizmoId) continue;
+
+                updateStatus(`Fetching GPT ${i + 1}/${allGPTs.length}: ${gpt.resource?.gizmo?.display?.name || gpt.gizmo?.display?.name || 'Unnamed'}...`);
+                try {
+                    const detail = await fetchAPI(`/backend-api/gizmos/${gizmoId}`);
+                    if (detail?.gizmo) {
+                        const g = detail.gizmo;
+                        state.customGPTs.push({
+                            id: g.id,
+                            name: g.display?.name || null,
+                            description: g.display?.description || null,
+                            instructions: g.instructions || null,
+                            welcome_message: g.display?.welcome_message || null,
+                            prompt_starters: g.display?.prompt_starters || [],
+                            profile_pic_url: g.display?.profile_picture_url || null,
+                            tools: (g.tools || []).map(t => ({
+                                type: t.type,
+                                ...(t.type === 'browser' ? {} : {}),
+                                ...(t.settings ? { settings: t.settings } : {}),
+                            })),
+                            actions: (detail.tools || []).filter(t => t.type === 'action').map(a => ({
+                                id: a.id,
+                                type: a.type,
+                                metadata: a.metadata || null,
+                            })),
+                            knowledge_files: (g.files || []).map(f => ({
+                                id: f.id,
+                                name: f.name,
+                                size: f.size || null,
+                                mime_type: f.mime_type || null,
+                            })),
+                            created_at: g.created_at ? new Date(g.created_at * 1000).toISOString() : null,
+                            updated_at: g.updated_at ? new Date(g.updated_at * 1000).toISOString() : null,
+                            share_recipient: g.share_recipient || null,
+                            tags: g.tags || [],
+                            vanity_url: g.vanity_metrics?.vanity_url || null,
+                            num_conversations: g.vanity_metrics?.num_conversations || 0,
+                        });
+                    }
+                } catch (e) {
+                    state.errors.push({ id: gizmoId, title: 'GPT: ' + (gpt.resource?.gizmo?.display?.name || gizmoId), error: e.message });
+                }
+                await sleep(state.currentDelay);
+            }
+            console.log(`[Unbind] Found ${state.customGPTs.length} custom GPTs`);
+        } catch (e) {
+            console.warn('[Unbind] Custom GPTs fetch failed:', e);
+        }
+    }
+
+    // ============================================================
+    // PROJECTS
+    // ============================================================
+
+    async function fetchProjects() {
+        updateStatus('Fetching projects...');
+        try {
+            const data = await fetchAPI('/backend-api/projects?limit=100').catch(() => null);
+            if (!data?.projects && !data?.items) {
+                // Try alternate endpoint
+                const alt = await fetchAPI('/backend-api/user_projects?limit=100').catch(() => null);
+                if (alt?.projects || alt?.items) {
+                    state.projects = (alt.projects || alt.items || []).map(formatProject);
+                }
+            } else {
+                const projects = data.projects || data.items || [];
+                // Fetch full details for each project
+                for (let i = 0; i < projects.length; i++) {
+                    const proj = projects[i];
+                    updateStatus(`Fetching project ${i + 1}/${projects.length}: ${proj.title || proj.name || 'Unnamed'}...`);
+                    try {
+                        const detail = await fetchAPI(`/backend-api/projects/${proj.id}`).catch(() => proj);
+                        state.projects.push(formatProject(detail));
+                    } catch {
+                        state.projects.push(formatProject(proj));
+                    }
+                    await sleep(300);
+                }
+            }
+            console.log(`[Unbind] Found ${state.projects.length} projects`);
+        } catch (e) {
+            console.warn('[Unbind] Projects fetch failed:', e);
+        }
+    }
+
+    function formatProject(proj) {
+        return {
+            id: proj.id,
+            title: proj.title || proj.name || null,
+            description: proj.description || null,
+            instructions: proj.instructions || proj.system_message || null,
+            created_at: proj.created_at ? new Date((typeof proj.created_at === 'number' ? proj.created_at * 1000 : proj.created_at)).toISOString() : null,
+            updated_at: proj.updated_at ? new Date((typeof proj.updated_at === 'number' ? proj.updated_at * 1000 : proj.updated_at)).toISOString() : null,
+            files: (proj.files || []).map(f => ({
+                id: f.id || null,
+                name: f.name || f.filename || null,
+                size: f.size || null,
+                mime_type: f.mime_type || null,
+            })),
+            conversation_ids: proj.conversation_ids || [],
+            is_archived: proj.is_archived || false,
+        };
+    }
+
+    // ============================================================
+    // USER PROFILE & PREFERENCES
+    // ============================================================
+
+    async function fetchUserProfile() {
+        updateStatus('Fetching user profile & preferences...');
+        try {
+            const [me, beta, dataControls] = await Promise.all([
+                fetchAPI('/backend-api/me').catch(() => null),
+                fetchAPI('/backend-api/settings/beta_features').catch(() => null),
+                fetchAPI('/backend-api/settings/account_user_setting').catch(() => null),
+            ]);
+            state.userProfile = {
+                user: me ? {
+                    id: me.id,
+                    name: me.name,
+                    email: me.email,
+                    picture: me.picture || null,
+                    created: me.created ? new Date(me.created * 1000).toISOString() : null,
+                    phone_number: me.phone_number || null,
+                    mfa_flag_enabled: me.mfa_flag_enabled || false,
+                } : null,
+                beta_features: beta || null,
+                data_controls: dataControls || null,
+            };
+        } catch (e) {
+            console.warn('[Unbind] User profile fetch failed:', e);
+        }
+    }
+
+    // ============================================================
+    // CANVAS / ARTIFACTS EXTRACTION
+    // ============================================================
+
+    function extractCanvasFromConversation(conversationData) {
+        // Canvas outputs are stored as special content parts in messages
+        const canvasItems = [];
+        if (!conversationData?.mapping) return canvasItems;
+
+        for (const [nodeId, node] of Object.entries(conversationData.mapping)) {
+            const msg = node.message;
+            if (!msg) continue;
+
+            // Check for canvas content type
+            const parts = msg.content?.parts || [];
+            for (const part of parts) {
+                if (part && typeof part === 'object') {
+                    // Canvas text document
+                    if (part.content_type === 'real_time_user_canvas_action_text_document' ||
+                        part.content_type === 'canvas_text_document' ||
+                        part.content_type === 'text_document') {
+                        canvasItems.push({
+                            type: 'document',
+                            content_type: part.content_type,
+                            title: part.title || null,
+                            content: part.text || part.content || null,
+                            language: part.language || null,
+                            version: part.version || null,
+                            message_id: msg.id,
+                            timestamp: msg.create_time ? new Date(msg.create_time * 1000).toISOString() : null,
+                        });
+                    }
+                    // Canvas code
+                    if (part.content_type === 'real_time_user_canvas_action_code' ||
+                        part.content_type === 'canvas_code' ||
+                        part.content_type === 'code_document') {
+                        canvasItems.push({
+                            type: 'code',
+                            content_type: part.content_type,
+                            title: part.title || null,
+                            content: part.text || part.code || part.content || null,
+                            language: part.language || null,
+                            version: part.version || null,
+                            message_id: msg.id,
+                            timestamp: msg.create_time ? new Date(msg.create_time * 1000).toISOString() : null,
+                        });
+                    }
+                }
+            }
+        }
+        return canvasItems;
     }
 
     // ============================================================
@@ -766,6 +1029,14 @@
         document.getElementById('unbind-final-convos').textContent = state.conversations.length;
         document.getElementById('unbind-final-msgs').textContent = state.totalMessages;
 
+        // Show additional stats
+        const extras = [];
+        if (state.customGPTs.length > 0) extras.push(state.customGPTs.length + ' GPTs');
+        if (state.projects.length > 0) extras.push(state.projects.length + ' projects');
+        if (state.canvasOutputs.length > 0) extras.push(state.canvasOutputs.reduce((s, c) => s + c.items.length, 0) + ' canvas items');
+        const extrasEl = document.getElementById('unbind-final-extras');
+        if (extrasEl && extras.length > 0) extrasEl.textContent = extras.join(' + ');
+
         if (state.errors.length > 0) {
             const errEl = document.getElementById('unbind-final-errors');
             if (errEl) {
@@ -780,6 +1051,9 @@
                 date: new Date().toISOString(),
                 conversations: state.conversations.length,
                 messages: state.totalMessages,
+                custom_gpts: state.customGPTs.length,
+                projects: state.projects.length,
+                canvas_artifacts: state.canvasOutputs.reduce((s, c) => s + c.items.length, 0),
                 errors: state.errors.length,
                 format: state.exportFormat,
                 workspace: state.workspace?.name || null,
@@ -878,6 +1152,9 @@
                 conversations_with_errors: state.errors.length,
                 export_duration_ms: Date.now() - state.startTime,
                 archived_conversations: state.archivedConversations.length,
+                custom_gpts: state.customGPTs.length,
+                projects: state.projects.length,
+                canvas_artifacts: state.canvasOutputs.reduce((s, c) => s + c.items.length, 0),
             },
             personalization: state.personalization,
             conversations: state.conversations.map(conv => ({
@@ -894,6 +1171,10 @@
                 messages: state.messages[conv.id] || [],
                 url: `https://chatgpt.com/c/${conv.id}`,
             })),
+            custom_gpts: state.customGPTs.length > 0 ? state.customGPTs : null,
+            projects: state.projects.length > 0 ? state.projects : null,
+            user_profile: state.userProfile || null,
+            canvas_artifacts: state.canvasOutputs.length > 0 ? state.canvasOutputs : null,
             errors: state.errors,
         };
     }
